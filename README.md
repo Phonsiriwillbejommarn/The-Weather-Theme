@@ -9,6 +9,55 @@ The resulting distilled Student model is published here: [Phonsiri/typhoon-3.5b-
 
 Due to hardware constraints (1x H100 GPU with a strict 5-hour daily quota), the project demonstrates advanced resource optimization and a modular training pipeline.
 
+## System Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph INIT["Phase 1: Initialization (One-time Setup)"]
+        A["typhoon-ai/typhoon-7b\n(32 Layers, 7B params)"]
+        B["prune_typhoon_3_5b.py\nEven-Layer Skip\nLayers 0,2,4,...,30"]
+        C["typhoon-3.5b-init\n(16 Layers, 3.5B params)\npublished to HF Hub"]
+        A -->|"Extract even layers"| B --> C
+    end
+
+    subgraph DATA["Phase 2: Data Pipeline (One-time Setup)"]
+        D1["uonlp/CulturaX (th)\nHigh-quality Web Corpus"]
+        D2["wikimedia/wikipedia (th)\nFactual Thai Text"]
+        E["prepare_thai_data.py\nHeuristic Filters\nThai ratio >= 40%\nLength 200–100k chars"]
+        F["thai-cpt-3.5b-data\nPre-tokenized 4096-token blocks\npublished to HF Hub"]
+        D1 & D2 --> E --> F
+    end
+
+    subgraph TRAIN["Phase 3: Distillation Training (Daily 5h Sessions)"]
+        direction TB
+        G["Stream batches from\nthai-cpt-3.5b-data"]
+        H["Teacher Forward Pass\ntyphoon-7b (frozen)\nOutputs: Logits + Hidden States"]
+        I["Student Forward Pass\ntyphoon-3.5b (trainable)\nOutputs: Logits + Hidden States"]
+        J["3-Part Distillation Loss\n① CE Loss  × 0.3\n② KL-Divergence × 0.5  T=2\n③ Hidden MSE  × 0.2"]
+        K["Optimizer Step\nAdamW + Cosine Warmup"]
+        G --> H & I --> J --> K --> G
+    end
+
+    subgraph RESUME["Auto-Resume (Cloud Restart)"]
+        L["Check HF Hub for latest\ntyphoon-3.5b-cpt-ckpt"]
+        M{"Found?"}
+        N["Load model weights\n+ optimizer + scheduler\n+ resume step counter"]
+        O["Start from scratch\nstep = 0"]
+        L --> M -->|Yes| N --> TRAIN
+        M -->|No| O --> TRAIN
+    end
+
+    subgraph CKPT["Checkpointing (Every 25 steps)"]
+        P["Save to local\ncpt_checkpoints/step_XXXXXXX\nconfig.json + safetensors\n+ optimizer.pt + projectors.pt"]
+        Q["Push to HF Hub\nPhonsiri/typhoon-3.5b-cpt-ckpt"]
+        K --> P --> Q
+    end
+
+    C -->|"Load as Student"| TRAIN
+    A -->|"Load as Teacher"| TRAIN
+    Q -.->|"Next Session"| RESUME
+```
+
 ## 2. System Components & Technical Solution
 The system is divided into three main components:
 
