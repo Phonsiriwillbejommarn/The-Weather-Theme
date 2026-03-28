@@ -58,6 +58,16 @@ flowchart TD
     Q -.->|"Next Session"| RESUME
 ```
 
+## Repository Structure
+
+| File | Description |
+|---|---|
+| `prune_typhoon_3_5b.py` | Prunes typhoon-7b from 32 → 16 layers (Even-skip). |
+| `prepare_thai_data.py` | Data Pipeline for CultureX and Wikipedia Thai. |
+| `cpt_distill_train.py` | Main Distillation Training Script with Auto-Resume. |
+| `evaluate_model.py` | Local evaluation script for measuring Perplexity (PPL). |
+| `app_demo.ipynb` | Application Demo (Gradio + Streamer) for Colab. |
+
 ## 2. System Components & Technical Solution
 The system is divided into three main components:
 
@@ -79,9 +89,16 @@ Instead of standard Pre-training, the model undergoes Deep Knowledge Distillatio
 To evaluate the effectiveness of the distilled 3.5B model against the 7B baseline, the following metrics will be used once the model reaches optimal convergence:
 * **Contextual & Reasoning (XNLI-th):** To measure zero-shot cross-lingual natural language inference specific to the Thai language.
 * **Factual Knowledge (ThaiExam):** To evaluate if the model retains essential knowledge after a 50% parameter reduction.
-* **Perplexity Score:** Measured on a held-out Thai evaluation dataset to ensure language fluency.
+* **Perplexity Score:** Measured on a held-out Thai evaluation dataset (`wikimedia/wikipedia`) using the provided `evaluate_model.py` script. A lower PPL indicates more fluent and predictable Thai generation.
 
-## 4. Application Demo (Gradio + Streamer)
+## 4. Contributor Information
+This project is submitted by:
+* **Name:** Jommarn Phonsirithabunsri
+* **University:** Suranaree University of Technology
+* **Major:** Computer Engineering (or your actual major)
+* **Goal:** Apply for Internship 2026 (Topic 2: SLM Distillation)
+
+## 5. Application Demo (Gradio + Streamer)
 To test the latest checkpoint of the model, the notebook loads the model in full **bfloat16** precision with token streaming.
 
 **How to run:**
