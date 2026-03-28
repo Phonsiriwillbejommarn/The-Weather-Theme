@@ -304,7 +304,6 @@ class HubStreamingDataset(IterableDataset):
             self.repo_id,
             split=self.split,
             streaming=True,
-            trust_remote_code=True,
         )
         if self.skip > 0:
             print(f"[dataset] Skipping first {self.skip:,} blocks for resume …")
