@@ -93,10 +93,9 @@ To evaluate the effectiveness of the distilled 3.5B model against the 7B baselin
 
 ## 4. Contributor Information
 This project is submitted by:
-* **Name:** Jommarn Phonsirithabunsri
+* **Name:** Pornsiri Thabunsri
 * **University:** Suranaree University of Technology
-* **Major:** Computer Engineering (or your actual major)
-* **Goal:** Apply for Internship 2026 (Topic 2: SLM Distillation)
+* **Major:** Computer Engineering
 
 ## 5. Application Demo (Gradio + Streamer)
 To test the latest checkpoint of the model, the notebook loads the model in full **bfloat16** precision with token streaming.
