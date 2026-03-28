@@ -1,0 +1,692 @@
+"""
+cpt_distill_train.py
+══════════════════════════════════════════════════════════════════════════════
+Off-policy Continued Pre-Training (CPT) via Knowledge Distillation
+  Teacher : typhoon-ai/typhoon-7b         (32 layers, ~7B params, frozen)
+  Student : Phonsiri/typhoon-3.5b-init    (16 layers, ~3.5B params, trained)
+
+Loss = α·L_CE  +  β·L_KD  +  γ·L_Hidden
+
+Hardware target : 1× NVIDIA H100 (80 GB VRAM)
+Precision       : bfloat16  (SDPA, no FlashAttention-2)
+Session limit   : 5 hours/day  →  auto-resume via HF Hub checkpoint backup
+
+Requirements:
+    pip install torch transformers datasets accelerate huggingface_hub tqdm
+══════════════════════════════════════════════════════════════════════════════
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  Imports & Global Config
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import gc
+import math
+import time
+import shutil
+import argparse
+import json
+from pathlib import Path
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
+
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_cosine_schedule_with_warmup,
+)
+from datasets import load_dataset
+from huggingface_hub import HfApi, snapshot_download, login, hf_hub_download
+from tqdm.auto import tqdm
+
+# ── Paths & Identifiers ──────────────────────────────────────────────────────
+TEACHER_MODEL_ID    = "typhoon-ai/typhoon-7b"
+STUDENT_BASE_ID     = "Phonsiri/typhoon-3.5b-init"   # pruned base on HF Hub
+CHECKPOINT_REPO     = "Phonsiri/typhoon-3.5b-cpt-ckpt"  # checkpoint backup repo
+OUTPUT_LOCAL_DIR    = "./cpt_output"
+CHECKPOINT_LOCAL    = "./cpt_checkpoints"
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+# Pre-cached Arrow shards produced by prepare_thai_data.py
+# Run: python prepare_thai_data.py   (once, before training)
+DATA_DIR = "./thai_cpt_data"   # folder containing shard_00000/, shard_00001/, …
+
+# ── Training Hyper-parameters ────────────────────────────────────────────────
+MAX_SEQ_LEN     = 4096          # Typhoon context length (matches prepare_thai_data.py BLOCK_SIZE)
+BATCH_SIZE      = 4           # per-device; H100 80GB can handle 4-8 at seq2048
+GRAD_ACCUM      = 8           # effective batch = 32
+LR              = 2e-4
+WARMUP_STEPS    = 200
+MAX_STEPS       = 50_000      # total training steps across all sessions
+LOG_EVERY       = 10          # log every N steps
+SAVE_EVERY      = 25          # save + push to HF every N steps (cloud resets each session)
+SESSION_HOURS   = 5.0         # hard-stop after this many hours
+
+# ── Loss Weights ─────────────────────────────────────────────────────────────
+ALPHA   = 0.3    # weight for L_CE  (cross-entropy on labels)
+BETA    = 0.5    # weight for L_KD  (KL-divergence on logits)
+GAMMA   = 0.2    # weight for L_Hidden (MSE on hidden states)
+TEMP_KD = 2.0    # temperature for KD softening
+
+# ── Precision ────────────────────────────────────────────────────────────────
+DTYPE = torch.bfloat16
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Utility: Clean Hugging Face Cache
+# ─────────────────────────────────────────────────────────────────────────────
+def clean_hf_cache(keep_gb: float = 10.0):
+    """
+    Scan ~/.cache/huggingface and delete blobs/refs that push total usage
+    above `keep_gb` GB.  Always keeps the two model caches we actually need.
+    Prints a summary of freed space.
+    """
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    if not hf_cache.exists():
+        print("[cache] HF cache dir not found — skipping.")
+        return
+
+    keep_ids = {
+        TEACHER_MODEL_ID.replace("/", "--"),
+        STUDENT_BASE_ID.replace("/", "--"),
+        CHECKPOINT_REPO.replace("/", "--"),
+    }
+
+    total_before = sum(f.stat().st_size for f in hf_cache.rglob("*") if f.is_file())
+    freed = 0
+
+    for model_dir in hf_cache.iterdir():
+        if not model_dir.is_dir():
+            continue
+        # Strip "models--" prefix for comparison
+        dir_name = model_dir.name.replace("models--", "")
+        if dir_name in keep_ids:
+            continue
+        dir_size = sum(f.stat().st_size for f in model_dir.rglob("*") if f.is_file())
+        if (total_before - freed) / 1e9 > keep_gb:
+            shutil.rmtree(model_dir, ignore_errors=True)
+            freed += dir_size
+            print(f"  [cache] Deleted {model_dir.name}  ({dir_size/1e9:.2f} GB)")
+
+    print(f"[cache] Freed {freed/1e9:.2f} GB  |  "
+          f"Remaining ≈ {(total_before-freed)/1e9:.2f} GB")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Layer Pruning Helper (32 → 16 even-skip)
+#     Only called when STUDENT_BASE_ID is not yet available locally/on Hub.
+# ─────────────────────────────────────────────────────────────────────────────
+def prune_teacher_to_student(save_dir: str = "./typhoon-3.5b-init") -> str:
+    """
+    Prune typhoon-7b from 32 layers to 16 (even-indexed) and save locally.
+    Returns the path to the saved student model.
+    """
+    if Path(save_dir).exists():
+        print(f"[prune] Student init already at {save_dir} — skipping.")
+        return save_dir
+
+    print("[prune] Loading teacher for pruning …")
+    cfg = AutoConfig.from_pretrained(TEACHER_MODEL_ID)
+    tok = AutoTokenizer.from_pretrained(TEACHER_MODEL_ID)
+
+    cfg.num_hidden_layers = 16
+    teacher = AutoModelForCausalLM.from_pretrained(
+        TEACHER_MODEL_ID, dtype=DTYPE, device_map="cpu", trust_remote_code=True
+    )
+    student = AutoModelForCausalLM.from_config(cfg).to(dtype=DTYPE)
+
+    with torch.no_grad():
+        student.model.embed_tokens.load_state_dict(teacher.model.embed_tokens.state_dict())
+        student.model.norm.load_state_dict(teacher.model.norm.state_dict())
+        student.lm_head.load_state_dict(teacher.lm_head.state_dict())
+        for i in range(16):
+            student.model.layers[i].load_state_dict(teacher.model.layers[i * 2].state_dict())
+
+    student.save_pretrained(save_dir)
+    tok.save_pretrained(save_dir)
+    del teacher
+    gc.collect()
+    print(f"[prune] Student saved to {save_dir}")
+    return save_dir
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Auto-Resume: find latest checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
+def find_latest_local_checkpoint(root: str) -> str | None:
+    root = Path(root)
+    if not root.exists():
+        return None
+    ckpts = sorted(
+        [d for d in root.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=lambda d: int(d.name.split("_")[1])
+    )
+    return str(ckpts[-1]) if ckpts else None
+
+
+def download_checkpoint_from_hub(repo_id: str, local_dir: str) -> str | None:
+    """
+    Download latest checkpoint folder from HF Hub backup repo.
+    Returns local path or None if nothing found.
+    """
+    api = HfApi()
+    try:
+        files = api.list_repo_files(repo_id, repo_type="model")
+    except Exception:
+        print(f"[resume] Checkpoint repo '{repo_id}' not found or empty.")
+        return None
+
+    # Find latest step folder in the hub repo
+    step_dirs = set()
+    for f in files:
+        parts = f.split("/")
+        if parts[0].startswith("step_"):
+            step_dirs.add(parts[0])
+
+    if not step_dirs:
+        return None
+
+    latest = sorted(step_dirs, key=lambda s: int(s.split("_")[1]))[-1]
+    print(f"[resume] Downloading checkpoint '{latest}' from Hub …")
+
+    # Download to the ROOT of local_dir so snapshot_download creates step_XXXXXXX/
+    # inside it.  DO NOT set local_dir=local_dir/step_XXXXXXX or files double-nest.
+    root_dir = Path(local_dir)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            local_dir=str(root_dir),          # ← root, not subdir
+            allow_patterns=[f"{latest}/*"],   # only download this step's files
+        )
+    except Exception as e:
+        print(f"[resume] Download failed: {e}")
+        return None
+
+    local_path = root_dir / latest
+
+    # Verify all required files are present
+    required = ["model.pt", "optimizer.pt", "scheduler.pt", "meta.json"]
+    missing = [f for f in required if not (local_path / f).exists()]
+    if missing:
+        print(f"[resume] ⚠️  Missing files after download: {missing}")
+        return None
+
+    print(f"[resume] ✅ Checkpoint ready at {local_path}")
+    return str(local_path)
+
+
+def resolve_checkpoint(local_root: str, hub_repo: str) -> str | None:
+    """
+    Resume logic for cloud: ALWAYS try HF Hub first since cloud machines
+    lose local files between sessions.  Local is only used as fast-path
+    if the machine happens to have it (e.g. same session restart).
+    """
+    # Fast-path: local exists (same-session restart)
+    ckpt = find_latest_local_checkpoint(local_root)
+    if ckpt:
+        print(f"[resume] Found local checkpoint (same-session fast-path): {ckpt}")
+        return ckpt
+
+    # Primary path: always pull from HF Hub (new cloud machine each session)
+    print("[resume] Pulling latest checkpoint from HF Hub (cloud resume) …")
+    ckpt = download_checkpoint_from_hub(hub_repo, local_root)
+    if ckpt:
+        return ckpt
+
+    print("[resume] No checkpoint found anywhere — starting from scratch.")
+    return None
+
+
+def load_checkpoint(ckpt_dir: str, model, optimizer, scheduler) -> int:
+    """Load model weights + optimizer + scheduler from checkpoint dir."""
+    ckpt_dir = Path(ckpt_dir)
+    # Model weights
+    model.load_state_dict(
+        torch.load(ckpt_dir / "model.pt", map_location="cpu", weights_only=True)
+    )
+    # Optimizer
+    optimizer.load_state_dict(
+        torch.load(ckpt_dir / "optimizer.pt", map_location="cpu", weights_only=True)
+    )
+    # Scheduler
+    scheduler.load_state_dict(
+        torch.load(ckpt_dir / "scheduler.pt", map_location="cpu", weights_only=True)
+    )
+    # Step counter
+    meta = json.loads((ckpt_dir / "meta.json").read_text())
+    step = meta.get("global_step", 0)
+    print(f"[resume] Resumed from step {step}")
+    return step
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Projection Layer (Student hidden_dim → Teacher hidden_dim)
+# ─────────────────────────────────────────────────────────────────────────────
+class HiddenProjector(nn.Module):
+    """Linear projection to align Student hidden states with Teacher's dim."""
+    def __init__(self, student_dim: int, teacher_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(student_dim, teacher_dim, bias=False)
+        nn.init.eye_(self.proj.weight if student_dim == teacher_dim
+                     else self.proj.weight[:min(student_dim, teacher_dim),
+                                           :min(student_dim, teacher_dim)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Dataset: pre-cached Arrow shards (from prepare_thai_data.py)
+# ─────────────────────────────────────────────────────────────────────────────
+from datasets import load_from_disk
+from torch.utils.data import Dataset as TorchDataset
+
+class ArrowShardDataset(TorchDataset):
+    """
+    Reads pre-tokenized 4096-token block shards from disk.
+    Each shard is an Arrow dataset with columns: input_ids, labels.
+    Supports skip_blocks to resume mid-dataset across sessions.
+    """
+    def __init__(self, data_dir: str, skip_blocks: int = 0):
+        self.data_dir = Path(data_dir)
+        shard_dirs = sorted(
+            [d for d in self.data_dir.iterdir() if d.is_dir() and d.name.startswith("shard_")]
+        )
+        if not shard_dirs:
+            raise FileNotFoundError(
+                f"No shards found in '{data_dir}'. "
+                "Run prepare_thai_data.py first."
+            )
+        # Concatenate all shards
+        from datasets import concatenate_datasets
+        shards = [load_from_disk(str(s)) for s in shard_dirs]
+        self.ds = concatenate_datasets(shards)
+        if skip_blocks > 0:
+            skip_blocks = min(skip_blocks, len(self.ds))
+            self.ds = self.ds.select(range(skip_blocks, len(self.ds)))
+        print(f"[dataset] Loaded {len(self.ds):,} blocks from {len(shard_dirs)} shards "
+              f"(skipped {skip_blocks:,})")
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        row = self.ds[idx]
+        return {
+            "input_ids": torch.tensor(row["input_ids"], dtype=torch.long),
+            "labels":    torch.tensor(row["labels"],    dtype=torch.long),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Loss Functions
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Standard next-token prediction cross-entropy."""
+    # logits: [B, T, V]  labels: [B, T]
+    B, T, V = logits.shape
+    return F.cross_entropy(
+        logits.reshape(B * T, V),
+        labels.reshape(B * T),
+        ignore_index=-100,
+    )
+
+
+def compute_kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """KL-divergence between softened student and teacher distributions."""
+    T = temperature
+    s = F.log_softmax(student_logits / T, dim=-1)
+    t = F.softmax(teacher_logits  / T, dim=-1)
+    # kl_div: input=log-probs, target=probs, reduction=batchmean
+    return F.kl_div(s, t, reduction="batchmean") * (T ** 2)
+
+
+def compute_hidden_loss(
+    student_hiddens: list[torch.Tensor],
+    teacher_hiddens: list[torch.Tensor],
+    projectors: nn.ModuleList,
+) -> torch.Tensor:
+    """MSE between projected student hidden states and teacher hidden states.
+    
+    Maps every student layer to the corresponding even teacher layer:
+        student[i] vs teacher[2*i]
+    """
+    total = torch.tensor(0.0, device=student_hiddens[0].device, dtype=student_hiddens[0].dtype)
+    n = len(student_hiddens)
+    for i, (s_h, proj) in enumerate(zip(student_hiddens, projectors)):
+        t_h = teacher_hiddens[i]           # already selected even layer output
+        projected = proj(s_h.to(dtype=torch.float32)).to(dtype=s_h.dtype)
+        total = total + F.mse_loss(projected, t_h.detach())
+    return total / n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Checkpoint Save + Hub Push
+# ─────────────────────────────────────────────────────────────────────────────
+def save_checkpoint(
+    step: int,
+    model,
+    optimizer,
+    scheduler,
+    projectors: nn.ModuleList,
+    local_root: str,
+):
+    ckpt_dir = Path(local_root) / f"step_{step:07d}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save(model.state_dict(), ckpt_dir / "model.pt")
+    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
+    torch.save(projectors.state_dict(), ckpt_dir / "projectors.pt")
+    (ckpt_dir / "meta.json").write_text(
+        json.dumps({"global_step": step, "saved_at": datetime.utcnow().isoformat()})
+    )
+    print(f"[ckpt] Saved checkpoint → {ckpt_dir}")
+    return str(ckpt_dir)
+
+
+def push_checkpoint_to_hub(ckpt_dir: str, repo_id: str):
+    """Upload checkpoint folder to HF Hub model repo."""
+    api = HfApi()
+    # Ensure repo exists
+    try:
+        api.create_repo(repo_id, repo_type="model", exist_ok=True, private=True)
+    except Exception:
+        pass
+
+    step_name = Path(ckpt_dir).name
+    print(f"[hub] Pushing {step_name} → {repo_id} …")
+    api.upload_folder(
+        folder_path=ckpt_dir,
+        repo_id=repo_id,
+        repo_type="model",
+        path_in_repo=step_name,
+        commit_message=f"Checkpoint at {step_name}",
+    )
+    print(f"[hub] ✅ Push complete → https://huggingface.co/{repo_id}")
+
+
+def cleanup_old_local_checkpoints(local_root: str, keep: int = 2):
+    """Keep only the `keep` most recent checkpoint dirs."""
+    root = Path(local_root)
+    ckpts = sorted(
+        [d for d in root.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+    for old in ckpts[:-keep]:
+        shutil.rmtree(old, ignore_errors=True)
+        print(f"[ckpt] Deleted old checkpoint {old.name}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Main Training Entry
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="CPT Knowledge Distillation")
+    parser.add_argument("--skip-prune", action="store_true",
+                        help="Skip pruning step (student already exists on Hub)")
+    parser.add_argument("--no-hub-sync", action="store_true",
+                        help="Disable HF Hub checkpoint push")
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--grad-accum", type=int, default=GRAD_ACCUM)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--session-hours", type=float, default=SESSION_HOURS)
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR,
+                        help="Path to pre-cached Arrow shards from prepare_thai_data.py")
+    args = parser.parse_args()
+
+    session_start = time.time()
+    session_limit_secs = args.session_hours * 3600
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*70}")
+    print(f"  CPT Distillation  |  device={device}  |  dtype={DTYPE}")
+    print(f"{'='*70}\n")
+
+    # ── HF Login (Python-based, works on Cloud without CLI) ──────────────────
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        login(token=hf_token)
+        print("[auth] ✅ Logged in to Hugging Face Hub via HF_TOKEN env var.")
+    else:
+        print("[auth] ⚠️  HF_TOKEN not set — assuming already logged in or using public repos.")
+        print("[auth]    Set with: export HF_TOKEN=hf_xxx...")
+
+    # ── Step 1: Clean cache ──────────────────────────────────────────────────
+    print("[init] Cleaning HF cache …")
+    clean_hf_cache(keep_gb=15.0)
+
+    # ── Step 2: Ensure student model is available locally ────────────────────
+    student_local_dir = "./typhoon-3.5b-init"
+    if args.skip_prune:
+        # On cloud: download from Hub if not already cached locally
+        if not Path(student_local_dir).exists():
+            print(f"[init] Student model not found locally.")
+            print(f"[init] Downloading {STUDENT_BASE_ID} from HF Hub …")
+            snapshot_download(
+                repo_id=STUDENT_BASE_ID,
+                repo_type="model",
+                local_dir=student_local_dir,
+            )
+            print(f"[init] ✅ Student downloaded → {student_local_dir}")
+        else:
+            print(f"[init] Student model found at {student_local_dir} — skipping download.")
+    else:
+        prune_teacher_to_student(save_dir=student_local_dir)
+
+    # ── Step 3: Load Tokenizer ───────────────────────────────────────────────
+    print("\n[init] Loading tokenizer …")
+    tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_ID)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ── Step 4: Load Teacher (frozen) ───────────────────────────────────────
+    print("[init] Loading teacher model (frozen) …")
+    teacher = AutoModelForCausalLM.from_pretrained(
+        TEACHER_MODEL_ID,
+        dtype=DTYPE,
+        device_map={"": device},
+        attn_implementation="sdpa",
+        trust_remote_code=True,
+    )
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    print(f"  Teacher params: {sum(p.numel() for p in teacher.parameters())/1e9:.2f}B  (frozen)")
+
+    # ── Step 5: Load Student (trainable) ────────────────────────────────────
+    print("[init] Loading student model …")
+    student = AutoModelForCausalLM.from_pretrained(
+        student_local_dir,          # always load from local (downloaded above)
+        dtype=DTYPE,
+        device_map={"": device},
+        attn_implementation="sdpa",
+    )
+    student.train()
+    student_params = sum(p.numel() for p in student.parameters())
+    print(f"  Student params: {student_params/1e9:.2f}B  (trainable)")
+
+    # ── Step 6: Build Projectors (one per student layer) ────────────────────
+    t_hidden = teacher.config.hidden_size
+    s_hidden = student.config.hidden_size
+    print(f"\n[init] Projectors: {s_hidden} → {t_hidden} (per layer, ×{student.config.num_hidden_layers})")
+    projectors = nn.ModuleList([
+        HiddenProjector(s_hidden, t_hidden)
+        for _ in range(student.config.num_hidden_layers)
+    ]).to(device=device, dtype=DTYPE)
+
+    # ── Step 7: Optimizer & Scheduler ───────────────────────────────────────
+    all_params = list(student.parameters()) + list(projectors.parameters())
+    optimizer  = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=0.01)
+    scheduler  = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=WARMUP_STEPS,
+        num_training_steps=args.max_steps,
+    )
+
+    # ── Step 8: Auto-Resume ──────────────────────────────────────────────────
+    global_step = 0
+    ckpt_path = resolve_checkpoint(CHECKPOINT_LOCAL, CHECKPOINT_REPO)
+    if ckpt_path:
+        global_step = load_checkpoint(ckpt_path, student, optimizer, scheduler)
+        # Also restore projectors if available
+        proj_file = Path(ckpt_path) / "projectors.pt"
+        if proj_file.exists():
+            projectors.load_state_dict(
+                torch.load(proj_file, map_location=device, weights_only=True)
+            )
+
+    # ── Step 9: DataLoader (pre-cached Arrow shards) ─────────────────────────
+    # Skip blocks already consumed in previous sessions (approximate)
+    skip_blocks = global_step * args.batch_size * args.grad_accum
+    dataset = ArrowShardDataset(
+        data_dir=args.data_dir,
+        skip_blocks=skip_blocks,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,         # shards are already shuffled at prep time
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+
+    # ── Step 10: Training Loop ───────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"  Starting training from step {global_step}/{args.max_steps}")
+    print(f"  Effective batch size: {args.batch_size * args.grad_accum}")
+    print(f"  Session limit: {args.session_hours}h")
+    print(f"{'='*70}\n")
+
+    scaler = torch.amp.GradScaler("cuda", enabled=False)   # bf16 doesn't need scaler
+    optimizer.zero_grad()
+    loss_accum = {"total": 0.0, "ce": 0.0, "kd": 0.0, "hidden": 0.0}
+    step_in_session = 0
+
+    for micro_batch in loader:
+        # ── Time / Step Guard ────────────────────────────────────────────────
+        elapsed = time.time() - session_start
+        if elapsed >= session_limit_secs:
+            print(f"\n[stop] Session limit ({args.session_hours}h) reached at step {global_step}.")
+            break
+        if global_step >= args.max_steps:
+            print(f"\n[stop] Max steps ({args.max_steps}) reached.")
+            break
+
+        input_ids = micro_batch["input_ids"].to(device)
+        labels    = micro_batch["labels"].to(device)
+
+        # ── Forward: Teacher (no grad) ───────────────────────────────────────
+        with torch.no_grad():
+            t_out = teacher(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            # Select every-other teacher hidden state (layers 0,2,4,…,30)
+            t_hiddens = [t_out.hidden_states[i * 2 + 1]
+                         for i in range(student.config.num_hidden_layers)]
+
+        # ── Forward: Student ─────────────────────────────────────────────────
+        s_out = student(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        s_hiddens = list(s_out.hidden_states[1:])   # skip embedding layer (idx 0)
+
+        # ── Loss Computation ─────────────────────────────────────────────────
+        l_ce     = compute_ce_loss(s_out.logits, labels)
+        l_kd     = compute_kd_loss(s_out.logits, t_out.logits, TEMP_KD)
+        l_hidden = compute_hidden_loss(s_hiddens, t_hiddens, projectors)
+
+        loss = (ALPHA * l_ce) + (BETA * l_kd) + (GAMMA * l_hidden)
+        loss = loss / args.grad_accum
+
+        loss.backward()
+
+        # ── Accumulate logging stats ─────────────────────────────────────────
+        loss_accum["total"]  += loss.item()
+        loss_accum["ce"]     += l_ce.item() / args.grad_accum
+        loss_accum["kd"]     += l_kd.item() / args.grad_accum
+        loss_accum["hidden"] += l_hidden.item() / args.grad_accum
+
+        step_in_session += 1
+
+        # ── Optimizer step every GRAD_ACCUM micro-batches ───────────────────
+        if step_in_session % args.grad_accum == 0:
+            nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
+
+            # ── Logging ──────────────────────────────────────────────────────
+            if global_step % LOG_EVERY == 0:
+                lr_now = scheduler.get_last_lr()[0]
+                print(
+                    f"step {global_step:>6}/{args.max_steps}"
+                    f"  loss={loss_accum['total']:.4f}"
+                    f"  ce={loss_accum['ce']:.4f}"
+                    f"  kd={loss_accum['kd']:.4f}"
+                    f"  hidden={loss_accum['hidden']:.4f}"
+                    f"  lr={lr_now:.2e}"
+                    f"  elapsed={elapsed/3600:.2f}h"
+                )
+                loss_accum = {k: 0.0 for k in loss_accum}
+
+            # ── Save & Push Checkpoint ────────────────────────────────────────
+            if global_step % SAVE_EVERY == 0:
+                ckpt_dir = save_checkpoint(
+                    global_step, student, optimizer, scheduler, projectors,
+                    local_root=CHECKPOINT_LOCAL,
+                )
+                cleanup_old_local_checkpoints(CHECKPOINT_LOCAL, keep=2)
+
+                if not args.no_hub_sync:
+                    try:
+                        push_checkpoint_to_hub(ckpt_dir, CHECKPOINT_REPO)
+                    except Exception as e:
+                        print(f"[hub] ⚠️  Push failed (will retry next save): {e}")
+
+    # ── Final Save ───────────────────────────────────────────────────────────
+    print("\n[done] Saving final checkpoint …")
+    ckpt_dir = save_checkpoint(
+        global_step, student, optimizer, scheduler, projectors,
+        local_root=CHECKPOINT_LOCAL,
+    )
+    if not args.no_hub_sync:
+        push_checkpoint_to_hub(ckpt_dir, CHECKPOINT_REPO)
+
+    # Also save the final student model weights for inference
+    out_path = Path(OUTPUT_LOCAL_DIR) / f"step_{global_step:07d}"
+    student.save_pretrained(str(out_path))
+    tokenizer.save_pretrained(str(out_path))
+    print(f"[done] Final student model saved → {out_path}")
+
+    total_time = (time.time() - session_start) / 3600
+    print(f"\n{'='*70}")
+    print(f"  Session complete!")
+    print(f"  Steps this session : {step_in_session // args.grad_accum}")
+    print(f"  Global step        : {global_step}/{args.max_steps}")
+    print(f"  Total time         : {total_time:.2f}h")
+    print(f"  Checkpoint backup  : https://huggingface.co/{CHECKPOINT_REPO}")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    main()
