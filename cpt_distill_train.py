@@ -58,7 +58,7 @@ DATASET_REPO    = "Phonsiri/thai-cpt-3.5b-data"
 
 # ── Training Hyper-parameters ────────────────────────────────────────────────
 MAX_SEQ_LEN     = 4096          # Typhoon context length (matches prepare_thai_data.py BLOCK_SIZE)
-BATCH_SIZE      = 2           # H100 80GB OOM at 4 due to 7B+3.5B + 4096 ctx
+BATCH_SIZE      = 1           # H100 80GB OOM at 4 due to 7B+3.5B + 4096 ctx
 GRAD_ACCUM      = 16          # effective batch = 32
 LR              = 2e-4
 WARMUP_STEPS    = 200
@@ -337,9 +337,11 @@ def compute_kd_loss(
 ) -> torch.Tensor:
     """KL-divergence between softened student and teacher distributions."""
     T = temperature
-    s = F.log_softmax(student_logits / T, dim=-1)
-    t = F.softmax(teacher_logits  / T, dim=-1)
+    B, Seq, V = student_logits.shape
+    s = F.log_softmax(student_logits.view(B * Seq, V) / T, dim=-1)
+    t = F.softmax(teacher_logits.view(B * Seq, V) / T, dim=-1)
     # kl_div: input=log-probs, target=probs, reduction=batchmean
+    # Since we flattened B*Seq into dim 0, batchmean will average across all tokens
     return F.kl_div(s, t, reduction="batchmean") * (T ** 2)
 
 
