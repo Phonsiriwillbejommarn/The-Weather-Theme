@@ -4,7 +4,7 @@ prepare_thai_data.py
 Thai CPT Data Preparation Pipeline  (based on Typhoon paper §3.1)
 
 Steps:
-  1. Stream MC4 (th) + Oscar (unshuffled_deduplicated_th) from HuggingFace
+  1. Stream cc100 (th) + uonlp/CulturaX (th) from HuggingFace
   2. Heuristic filtering  (char ratio, line length, doc length)
   3. Tokenize with typhoon-ai/typhoon-7b tokenizer
   4. Pack into 4096-token blocks and save as Arrow shards on disk
@@ -39,10 +39,10 @@ MAX_SHARDS          = None          # set int to limit (None = unlimited)
 # ── Source datasets ───────────────────────────────────────────────────────────
 SOURCES = [
     # (dataset_id, subset/config, split)
-    # MC4 Thai  — higher quality per Typhoon §3.1
-    ("mc4",                       "th",                        "train"),
-    # Oscar Thai — larger but noisier; filtered more aggressively
-    ("oscar-corpus/OSCAR-2301",   "th",                        "train"),
+    # cc100 Thai — Common Crawl 100, public Parquet, no script needed
+    ("cc100",           "th",   "train"),
+    # CulturaX Thai — high-quality multilingual, deduplicated
+    ("uonlp/CulturaX",  "th",   "train"),
 ]
 
 # ── Heuristic Filter Thresholds  (Typhoon / Falcon RefinedWeb style) ─────────
@@ -162,7 +162,6 @@ def stream_filtered_texts(dataset_id: str, subset: str, split: str) -> Iterator[
             subset,
             split=split,
             streaming=True,
-            trust_remote_code=True,
         )
     except Exception as e:
         print(f"  [WARNING] Could not load {dataset_id}/{subset}: {e}")
