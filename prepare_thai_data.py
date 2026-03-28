@@ -9,8 +9,9 @@ Steps:
   3. Tokenize with typhoon-ai/typhoon-7b tokenizer
   4. Pack into 4096-token blocks and save as Arrow shards on disk
 
-Output: ./thai_cpt_data/  (Arrow dataset shards, ready for DataLoader)
-
+Output: 
+  1. ./thai_cpt_data/  (Arrow dataset shards locally)
+  2. Pushed to Hugging Face Hub as Phonsiri/thai-cpt-3.5b-data
 Requirements:
     pip install transformers datasets tqdm
 ══════════════════════════════════════════════════════════════════════════════
@@ -32,6 +33,7 @@ from tqdm.auto import tqdm
 # ─────────────────────────────────────────────────────────────────────────────
 TOKENIZER_ID        = "typhoon-ai/typhoon-7b"
 OUTPUT_DIR          = "./thai_cpt_data"
+HF_DATASET_REPO     = "Phonsiri/thai-cpt-3.5b-data" # Where to upload the result
 BLOCK_SIZE          = 4096          # Typhoon context length
 SHARD_SIZE          = 50_000        # blocks per shard file
 MAX_SHARDS          = None          # set int to limit (None = unlimited)
@@ -273,10 +275,22 @@ def main():
     print(f"  Total tokens   : {total_tokens:,}  ({total_tokens/1e9:.2f}B)")
     print(f"  Block size     : {BLOCK_SIZE} tokens")
     print("=" * 70)
-    print("\nNext step: pass OUTPUT_DIR to your CPT training script DataLoader.")
-    print("Example:")
-    print("  from datasets import load_from_disk")
-    print(f"  ds = load_from_disk('{OUTPUT_DIR}/shard_00000')")
+
+    # ── Push to Hugging Face Hub ─────────────────────────────────────────────
+    print(f"\n[hub] Pushing prepared dataset to {HF_DATASET_REPO} …")
+    try:
+        from datasets import load_from_disk
+        shard_dirs = sorted([d for d in out_dir.iterdir() if d.is_dir() and d.name.startswith("shard_")])
+        if shard_dirs:
+            shards = [load_from_disk(str(s)) for s in shard_dirs]
+            full_ds = concatenate_datasets(shards)
+            full_ds.push_to_hub(HF_DATASET_REPO, private=True)
+            print(f"[hub] ✅ Successfully published to https://huggingface.co/datasets/{HF_DATASET_REPO}")
+        else:
+            print("[hub] ⚠️  No shards found to push.")
+    except Exception as e:
+        print(f"[hub] ❌ Failed to push to hub: {e}")
+        print("[hub] Did you `export HF_TOKEN=...` before running?")
 
 
 if __name__ == "__main__":
