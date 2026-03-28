@@ -213,7 +213,7 @@ def download_checkpoint_from_hub(repo_id: str, local_dir: str) -> str | None:
     local_path = root_dir / latest
 
     # Verify all required files are present
-    required = ["model.pt", "optimizer.pt", "scheduler.pt", "meta.json"]
+    required = ["optimizer.pt", "scheduler.pt", "meta.json"]
     missing = [f for f in required if not (local_path / f).exists()]
     if missing:
         print(f"[resume] ⚠️  Missing files after download: {missing}")
@@ -245,13 +245,9 @@ def resolve_checkpoint(local_root: str, hub_repo: str) -> str | None:
     return None
 
 
-def load_checkpoint(ckpt_dir: str, model, optimizer, scheduler) -> int:
-    """Load model weights + optimizer + scheduler from checkpoint dir."""
+def load_checkpoint(ckpt_dir: str, optimizer, scheduler) -> int:
+    """Load optimizer + scheduler from checkpoint dir."""
     ckpt_dir = Path(ckpt_dir)
-    # Model weights
-    model.load_state_dict(
-        torch.load(ckpt_dir / "model.pt", map_location="cpu", weights_only=True)
-    )
     # Optimizer
     optimizer.load_state_dict(
         torch.load(ckpt_dir / "optimizer.pt", map_location="cpu", weights_only=True)
@@ -371,6 +367,7 @@ def compute_hidden_loss(
 def save_checkpoint(
     step: int,
     model,
+    tokenizer,
     optimizer,
     scheduler,
     projectors: nn.ModuleList,
@@ -379,7 +376,12 @@ def save_checkpoint(
     ckpt_dir = Path(local_root) / f"step_{step:07d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(model.state_dict(), ckpt_dir / "model.pt")
+    model.save_pretrained(ckpt_dir, safe_serialization=True)
+    try:
+        tokenizer.save_pretrained(ckpt_dir)
+    except Exception as e:
+        print(f"[ckpt] ⚠️ Failed to save tokenizer: {e}")
+
     torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
     torch.save(projectors.state_dict(), ckpt_dir / "projectors.pt")
@@ -500,10 +502,20 @@ def main():
         p.requires_grad = False
     print(f"  Teacher params: {sum(p.numel() for p in teacher.parameters())/1e9:.2f}B  (frozen)")
 
-    # ── Step 5: Load Student (trainable) ────────────────────────────────────
-    print("[init] Loading student model …")
+    # ── Step 5: Auto-Resume Checkpoint Resolution ────────────────────────────
+    global_step = 0
+    ckpt_path = resolve_checkpoint(CHECKPOINT_LOCAL, CHECKPOINT_REPO)
+    
+    # If checkpoint is modern HF format (has config), load directly natively.
+    # If it's legacy (or doesn't exist), fall back to base student init.
+    if ckpt_path and (Path(ckpt_path) / "config.json").exists():
+        student_load_dir = ckpt_path
+    else:
+        student_load_dir = student_local_dir
+
+    print(f"[init] Loading student model from {student_load_dir} …")
     student = AutoModelForCausalLM.from_pretrained(
-        student_local_dir,          # always load from local (downloaded above)
+        student_load_dir,
         dtype=DTYPE,
         device_map={"": device},
         attn_implementation="sdpa",
@@ -530,11 +542,18 @@ def main():
         num_training_steps=args.max_steps,
     )
 
-    # ── Step 8: Auto-Resume ──────────────────────────────────────────────────
-    global_step = 0
-    ckpt_path = resolve_checkpoint(CHECKPOINT_LOCAL, CHECKPOINT_REPO)
+    # ── Step 8: Auto-Resume Optimizer & Scheduler ────────────────────────────
     if ckpt_path:
-        global_step = load_checkpoint(ckpt_path, student, optimizer, scheduler)
+        global_step = load_checkpoint(ckpt_path, optimizer, scheduler)
+        
+        # Legacy fallback: If the checkpoint was created before HF save_pretrained
+        # support was added, it only has model.pt. We must manually load it.
+        if (Path(ckpt_path) / "model.pt").exists():
+            print("[resume] Legacy model.pt found. Loading weights manually …")
+            student.load_state_dict(
+                torch.load(Path(ckpt_path) / "model.pt", map_location="cpu", weights_only=True)
+            )
+
         # Also restore projectors if available
         proj_file = Path(ckpt_path) / "projectors.pt"
         if proj_file.exists():
@@ -643,7 +662,7 @@ def main():
             # ── Save & Push Checkpoint ────────────────────────────────────────
             if global_step % SAVE_EVERY == 0:
                 ckpt_dir = save_checkpoint(
-                    global_step, student, optimizer, scheduler, projectors,
+                    global_step, student, tokenizer, optimizer, scheduler, projectors,
                     local_root=CHECKPOINT_LOCAL,
                 )
                 cleanup_old_local_checkpoints(CHECKPOINT_LOCAL, keep=2)
@@ -657,7 +676,7 @@ def main():
     # ── Final Save ───────────────────────────────────────────────────────────
     print("\n[done] Saving final checkpoint …")
     ckpt_dir = save_checkpoint(
-        global_step, student, optimizer, scheduler, projectors,
+        global_step, student, tokenizer, optimizer, scheduler, projectors,
         local_root=CHECKPOINT_LOCAL,
     )
     if not args.no_hub_sync:
