@@ -35,6 +35,7 @@ OUTPUT_DIR          = "./thai_cpt_data"
 BLOCK_SIZE          = 4096          # Typhoon context length
 SHARD_SIZE          = 50_000        # blocks per shard file
 MAX_SHARDS          = None          # set int to limit (None = unlimited)
+MAX_EXAMPLES_PER_SOURCE = 500_000   # raw docs per source (None = all)
 
 # ── Source datasets ───────────────────────────────────────────────────────────
 SOURCES = [
@@ -175,6 +176,9 @@ def stream_filtered_texts(dataset_id: str, subset: str, split: str) -> Iterator[
     total  = 0
     for ex in ds:
         total += 1
+        if MAX_EXAMPLES_PER_SOURCE and total > MAX_EXAMPLES_PER_SOURCE:
+            print(f"    {dataset_id}/{subset}: reached MAX_EXAMPLES_PER_SOURCE={MAX_EXAMPLES_PER_SOURCE:,} — stopping.")
+            break
         text = ex.get(text_col, "")
         if not isinstance(text, str) or not text:
             continue
