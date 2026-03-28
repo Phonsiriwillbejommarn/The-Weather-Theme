@@ -59,7 +59,7 @@ DATASET_REPO    = "Phonsiri/thai-cpt-3.5b-data"
 # ── Training Hyper-parameters ────────────────────────────────────────────────
 MAX_SEQ_LEN     = 4096          # Typhoon context length (matches prepare_thai_data.py BLOCK_SIZE)
 BATCH_SIZE      = 1           # H100 80GB OOM at 4 due to 7B+3.5B + 4096 ctx
-GRAD_ACCUM      = 16          # effective batch = 32
+GRAD_ACCUM      = 32          # effective batch = 32
 LR              = 2e-4
 WARMUP_STEPS    = 200
 MAX_STEPS       = 50_000      # total training steps across all sessions
