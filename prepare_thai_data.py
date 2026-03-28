@@ -40,10 +40,10 @@ MAX_EXAMPLES_PER_SOURCE = 500_000   # raw docs per source (None = all)
 # ── Source datasets ───────────────────────────────────────────────────────────
 SOURCES = [
     # (dataset_id, subset/config, split)
-    # cc100 Thai — Common Crawl 100, public Parquet, no script needed
-    ("cc100",           "th",   "train"),
     # CulturaX Thai — high-quality multilingual, deduplicated
-    ("uonlp/CulturaX",  "th",   "train"),
+    ("uonlp/CulturaX",      "th",           "train"),
+    # Wikipedia Thai — clean, factual, public Parquet
+    ("wikimedia/wikipedia", "20231101.th",  "train"),
 ]
 
 # ── Heuristic Filter Thresholds  (Typhoon / Falcon RefinedWeb style) ─────────
