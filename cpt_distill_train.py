@@ -63,7 +63,7 @@ GRAD_ACCUM      = 8           # effective batch = 32
 LR              = 2e-4
 WARMUP_STEPS    = 200
 MAX_STEPS       = 50_000      # total training steps across all sessions
-LOG_EVERY       = 10          # log every N steps
+LOG_EVERY       = 1           # log every N steps (set to 1 so you don't think it's hanging!)
 SAVE_EVERY      = 25          # save + push to HF every N steps (cloud resets each session)
 SESSION_HOURS   = 5.0         # hard-stop after this many hours
 
