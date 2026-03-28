@@ -106,4 +106,4 @@ To test the latest checkpoint of the model, the notebook loads the model in full
 3. Run the cells to stream text generation directly in the notebook.
 
 ---
-*Developed by Jommarn - Suranaree University of Technology*
+*Developed by Pornsiri - Suranaree University of Technology*
