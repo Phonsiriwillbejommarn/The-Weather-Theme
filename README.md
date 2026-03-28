@@ -81,13 +81,13 @@ To evaluate the effectiveness of the distilled 3.5B model against the 7B baselin
 * **Factual Knowledge (ThaiExam):** To evaluate if the model retains essential knowledge after a 50% parameter reduction.
 * **Perplexity Score:** Measured on a held-out Thai evaluation dataset to ensure language fluency.
 
-## 4. Application Demo (Gradio + 4-bit Quantization)
-To test the latest checkpoint of the model efficiently without requiring a massive VRAM server, a lightweight application has been provided.
+## 4. Application Demo (Gradio + Streamer)
+To test the latest checkpoint of the model, the notebook loads the model in full **bfloat16** precision with token streaming.
 
 **How to run:**
-1. Open the `app_demo.ipynb` file in Google Colab.
-2. The script utilizes `bitsandbytes` to load the model in 4-bit precision, reducing VRAM usage to ~2.5GB (compatible with Colab's free T4 GPU).
-3. Run the cells to launch a **Gradio Chat Interface** and interact with the model directly via a public web link.
+1. Open the `app_demo.ipynb` file in Google Colab (recommended: T4 GPU or higher, ~8GB VRAM).
+2. Set your `HF_TOKEN` and update the `STEP` variable to the latest checkpoint folder name.
+3. Run the cells to stream text generation directly in the notebook.
 
 ---
 *Developed by Jommarn - Suranaree University of Technology*
