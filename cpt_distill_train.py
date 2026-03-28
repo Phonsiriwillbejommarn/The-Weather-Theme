@@ -58,8 +58,8 @@ DATASET_REPO    = "Phonsiri/thai-cpt-3.5b-data"
 
 # ── Training Hyper-parameters ────────────────────────────────────────────────
 MAX_SEQ_LEN     = 4096          # Typhoon context length (matches prepare_thai_data.py BLOCK_SIZE)
-BATCH_SIZE      = 4           # per-device; H100 80GB can handle 4-8 at seq2048
-GRAD_ACCUM      = 8           # effective batch = 32
+BATCH_SIZE      = 2           # H100 80GB OOM at 4 due to 7B+3.5B + 4096 ctx
+GRAD_ACCUM      = 16          # effective batch = 32
 LR              = 2e-4
 WARMUP_STEPS    = 200
 MAX_STEPS       = 50_000      # total training steps across all sessions
@@ -357,8 +357,9 @@ def compute_hidden_loss(
     n = len(student_hiddens)
     for i, (s_h, proj) in enumerate(zip(student_hiddens, projectors)):
         t_h = teacher_hiddens[i]           # already selected even layer output
-        projected = proj(s_h.to(dtype=torch.float32)).to(dtype=s_h.dtype)
-        total = total + F.mse_loss(projected, t_h.detach())
+        # Project in native dtype (bfloat16) then cast to float32 for stable MSE
+        projected = proj(s_h).to(dtype=torch.float32)
+        total = total + F.mse_loss(projected, t_h.detach().to(dtype=torch.float32))
     return total / n
 
 
