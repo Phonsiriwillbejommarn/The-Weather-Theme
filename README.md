@@ -7,7 +7,7 @@ The objective of this project is to create a highly efficient 3.5B parameter Tha
 
 The resulting distilled Student model is published here: [Phonsiri/typhoon-3.5b-cpt-ckpt](https://huggingface.co/Phonsiri/typhoon-3.5b-cpt-ckpt).
 
-Due to hardware constraints (1x H100 GPU with a strict 5-hour daily quota), the project demonstrates advanced resource optimization and a modular training pipeline.
+Due to potential hardware constraints in cloud environments, the project demonstrates advanced resource optimization and a modular training pipeline with auto-resume capabilities.
 
 ## System Architecture Diagram
 

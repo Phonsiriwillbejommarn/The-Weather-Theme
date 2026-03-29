@@ -9,7 +9,7 @@ Loss = α·L_CE  +  β·L_KD  +  γ·L_Hidden
 
 Hardware target : 1× NVIDIA H100 (80 GB VRAM)
 Precision       : bfloat16  (SDPA, no FlashAttention-2)
-Session limit   : 5 hours/day  →  auto-resume via HF Hub checkpoint backup
+Training Mode   : Continued Pre-Training with Auto-Resume
 
 Requirements:
     pip install torch transformers datasets accelerate huggingface_hub tqdm
@@ -65,7 +65,7 @@ WARMUP_STEPS    = 200
 MAX_STEPS       = 50_000      # total training steps across all sessions
 LOG_EVERY       = 1           # log every N steps (set to 1 so you don't think it's hanging!)
 SAVE_EVERY      = 25          # save + push to HF every N steps (cloud resets each session)
-SESSION_HOURS   = 5.0         # hard-stop after this many hours
+SESSION_HOURS   = 72.0        # effectively unlimited for standard cloud sessions
 
 # ── Loss Weights ─────────────────────────────────────────────────────────────
 ALPHA   = 0.3    # weight for L_CE  (cross-entropy on labels)
